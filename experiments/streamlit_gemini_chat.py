@@ -123,6 +123,33 @@ def run_models_parallel(
     return results
 
 
+def run_models_parallel_progress(
+    model_entries: List[Dict[str, str]],
+    turns: List[Dict[str, Any]],
+    prompt: str,
+    image_bytes: bytes | None,
+    image_mime_type: str | None,
+):
+    workers = min(max(len(model_entries), 1), 8)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                run_model,
+                entry["api_key"],
+                entry["model"],
+                turns,
+                prompt,
+                image_bytes,
+                image_mime_type,
+            ): entry["model"]
+            for entry in model_entries
+        }
+        for future in as_completed(futures):
+            model = futures[future]
+            _, output = future.result()
+            yield model, output
+
+
 def validate_model_entries(model_entries: List[Dict[str, str]]) -> Tuple[bool, str, List[Dict[str, str]]]:
     cleaned_entries = []
     for entry in model_entries:
@@ -162,6 +189,22 @@ def render_chat(turns: List[Dict[str, Any]], current_models: List[str]) -> None:
 def main() -> None:
     st.set_page_config(page_title="Gemini Chat", page_icon=":speech_balloon:", layout="centered")
     st.title("Gemini Multi-Model Chat")
+    st.markdown(
+        """
+        <style>
+        [data-testid="column"] { min-width: 0; }
+        [data-testid="column"] .stMarkdown,
+        [data-testid="column"] .stCodeBlock,
+        [data-testid="column"] pre,
+        [data-testid="column"] code {
+          white-space: pre-wrap !important;
+          overflow-wrap: anywhere !important;
+          word-break: break-word !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     if "model_entries" not in st.session_state:
         st.session_state.model_entries = [
@@ -169,8 +212,6 @@ def main() -> None:
         ]
     if "turns" not in st.session_state:
         st.session_state.turns = []
-    if "image_uploader_nonce" not in st.session_state:
-        st.session_state.image_uploader_nonce = 0
 
     with st.sidebar:
         st.subheader("Settings")
@@ -217,49 +258,70 @@ def main() -> None:
     if current_models:
         render_chat(turns=st.session_state.turns, current_models=current_models)
 
-    uploaded_image = st.file_uploader(
-        "Optional image for next message",
-        type=["png", "jpg", "jpeg", "webp"],
-        key=f"pending_image_{st.session_state.image_uploader_nonce}",
+    chat_input_value = st.chat_input(
+        "Type your message...",
+        accept_file=True,
+        file_type=["png", "jpg", "jpeg", "webp"],
     )
-
-    prompt = st.chat_input("Type your message...")
-    if not prompt:
+    if not chat_input_value:
         return
+
+    prompt = ""
+    current_image_bytes = None
+    current_image_mime_type = None
+    current_image_name = None
+    if isinstance(chat_input_value, str):
+        prompt = chat_input_value
+    else:
+        prompt = chat_input_value.text
+        if chat_input_value.files:
+            first_file = chat_input_value.files[0]
+            current_image_bytes = first_file.getvalue()
+            current_image_mime_type = first_file.type
+            current_image_name = first_file.name
 
     if not is_valid:
         st.error(err_msg)
         return
-    if not prompt.strip():
-        st.error("Prompt cannot be empty.")
+    if not prompt.strip() and current_image_bytes is None:
+        st.error("Message cannot be empty. Enter text or attach an image.")
+        return
+    if not prompt.strip() and current_image_bytes is not None:
+        prompt = "Please analyze this image."
+    if current_image_bytes is not None and current_image_mime_type is None:
+        st.error("Could not determine image MIME type.")
         return
 
     with st.chat_message("user"):
         st.markdown(prompt)
-        current_image_bytes = None
-        current_image_mime_type = None
-        current_image_name = None
-        if uploaded_image is not None:
-            current_image_bytes = uploaded_image.getvalue()
-            current_image_mime_type = uploaded_image.type
-            current_image_name = uploaded_image.name
+        if current_image_bytes is not None:
             st.image(current_image_bytes, caption=current_image_name)
 
     with st.chat_message("assistant"):
+        response_map: Dict[str, str] = {}
+        columns = st.columns(len(current_models))
+        placeholders: Dict[str, Any] = {}
+        for col, model in zip(columns, current_models):
+            with col:
+                st.markdown(f"#### `{model}`")
+                placeholders[model] = st.empty()
+                placeholders[model].caption("Waiting...")
+
         with st.spinner("Thinking..."):
-            outputs = run_models_parallel(
+            for model, output in run_models_parallel_progress(
                 model_entries=cleaned_entries,
                 turns=st.session_state.turns,
                 prompt=prompt,
                 image_bytes=current_image_bytes,
                 image_mime_type=current_image_mime_type,
-            )
-        response_map = {item["model"]: item["output"] for item in outputs}
-        columns = st.columns(len(current_models))
-        for col, model in zip(columns, current_models):
-            with col:
-                st.markdown(f"#### `{model}`")
-                st.write(response_map.get(model, "No response returned for this model."))
+            ):
+                response_map[model] = output
+                placeholders[model].write(output)
+
+        for model in current_models:
+            if model not in response_map:
+                response_map[model] = "No response returned for this model."
+                placeholders[model].write(response_map[model])
 
     st.session_state.turns.append(
         {
@@ -270,7 +332,6 @@ def main() -> None:
             "image_name": current_image_name,
         }
     )
-    st.session_state.image_uploader_nonce += 1
 
 
 if __name__ == "__main__":
