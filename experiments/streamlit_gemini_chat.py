@@ -3,10 +3,14 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple, Any
 import mimetypes
+from datetime import datetime
+import ctypes
+import ctypes.wintypes as wintypes
 
 import streamlit as st
 from google import genai
 from google.genai import types
+from PIL import ImageGrab
 
 DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_IMAGE_FOLDER = Path(r"C:\Users\Pranav\Desktop\proj\github_projects\triton_practice\images")
@@ -39,15 +43,97 @@ def load_images_from_folder(folder: Path) -> List[Dict[str, Any]]:
     return images
 
 
+def clear_images_in_folder(folder: Path) -> int:
+    if not folder.exists() or not folder.is_dir():
+        return 0
+    supported_suffixes = {".png", ".jpg", ".jpeg", ".webp"}
+    deleted = 0
+    for path in folder.iterdir():
+        if not path.is_file() or path.suffix.lower() not in supported_suffixes:
+            continue
+        path.unlink(missing_ok=True)
+        deleted += 1
+    return deleted
+
+
+def find_matching_window(window_title: str) -> Tuple[int, str] | None:
+    query = window_title.strip().lower()
+    if not query:
+        return None
+
+    user32 = ctypes.windll.user32
+    candidates: List[Tuple[int, str]] = []
+    foreground = user32.GetForegroundWindow()
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def enum_windows_proc(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        if user32.IsIconic(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        title_raw = buffer.value.strip()
+        title = title_raw.lower()
+        if query in title:
+            candidates.append((hwnd, title_raw))
+        return True
+
+    user32.EnumWindows(enum_windows_proc, 0)
+    if not candidates:
+        return None
+
+    for hwnd, title in candidates:
+        if hwnd == foreground:
+            return hwnd, title
+
+    return candidates[0]
+
+
+def get_client_bbox(hwnd: int) -> Tuple[int, int, int, int] | None:
+    rect = wintypes.RECT()
+    ok = ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect))
+    if not ok:
+        return None
+    top_left = wintypes.POINT(rect.left, rect.top)
+    bottom_right = wintypes.POINT(rect.right, rect.bottom)
+    if not ctypes.windll.user32.ClientToScreen(hwnd, ctypes.byref(top_left)):
+        return None
+    if not ctypes.windll.user32.ClientToScreen(hwnd, ctypes.byref(bottom_right)):
+        return None
+    if bottom_right.x <= top_left.x or bottom_right.y <= top_left.y:
+        return None
+    return top_left.x, top_left.y, bottom_right.x, bottom_right.y
+
+
+def capture_window_screenshot_to_folder(window_title: str, folder: Path) -> Tuple[bool, str]:
+    match = find_matching_window(window_title)
+    if match is None:
+        return False, f"Window not found: {window_title}"
+    hwnd, matched_title = match
+    bbox = get_client_bbox(hwnd)
+    if bbox is None:
+        return False, f"Could not read client area for window: {matched_title}"
+    folder.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = folder / f"window_capture_{timestamp}.png"
+    image = ImageGrab.grab(bbox=bbox, all_screens=True)
+    if image.getbbox() is None:
+        return False, f"Captured blank image for window: {matched_title}"
+    image.save(output_path)
+    return True, f"{output_path} (matched: {matched_title})"
+
+
 def message_to_parts(message: Dict[str, Any]) -> List[types.Part]:
     parts: List[types.Part] = []
     text = message.get("content", "")
     if text:
         parts.append(types.Part(text=text))
-    image_bytes = message.get("image_bytes")
-    image_mime_type = message.get("image_mime_type")
-    if image_bytes and image_mime_type:
-        parts.append(types.Part.from_bytes(data=image_bytes, mime_type=image_mime_type))
+    for image in get_message_images(message):
+        parts.append(types.Part.from_bytes(data=image["bytes"], mime_type=image["mime_type"]))
     return parts
 
 
@@ -75,24 +161,22 @@ def build_messages_for_model(
     turns: List[Dict[str, Any]],
     model: str,
     prompt: str,
-    image_bytes: bytes | None,
-    image_mime_type: str | None,
+    current_images: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     messages: List[Dict[str, Any]] = []
     for turn in turns:
         user_message: Dict[str, Any] = {"role": "user", "content": turn["prompt"]}
-        if turn.get("image_bytes") and turn.get("image_mime_type"):
-            user_message["image_bytes"] = turn["image_bytes"]
-            user_message["image_mime_type"] = turn["image_mime_type"]
+        turn_images = get_message_images(turn)
+        if turn_images:
+            user_message["images"] = turn_images
         messages.append(user_message)
         model_response = turn["responses"].get(model)
         if model_response:
             messages.append({"role": "assistant", "content": model_response})
 
     latest_user_message: Dict[str, Any] = {"role": "user", "content": prompt}
-    if image_bytes and image_mime_type:
-        latest_user_message["image_bytes"] = image_bytes
-        latest_user_message["image_mime_type"] = image_mime_type
+    if current_images:
+        latest_user_message["images"] = current_images
     messages.append(latest_user_message)
     return messages
 
@@ -102,15 +186,13 @@ def run_model(
     model: str,
     turns: List[Dict[str, Any]],
     prompt: str,
-    image_bytes: bytes | None,
-    image_mime_type: str | None,
+    current_images: List[Dict[str, Any]],
 ) -> Tuple[str, str]:
     messages = build_messages_for_model(
         turns=turns,
         model=model,
         prompt=prompt,
-        image_bytes=image_bytes,
-        image_mime_type=image_mime_type,
+        current_images=current_images,
     )
     try:
         return model, call_gemini(api_key=api_key, model=model, messages=messages)
@@ -122,8 +204,7 @@ def run_models_parallel(
     model_entries: List[Dict[str, str]],
     turns: List[Dict[str, Any]],
     prompt: str,
-    image_bytes: bytes | None,
-    image_mime_type: str | None,
+    current_images: List[Dict[str, Any]],
 ) -> List[Dict[str, str]]:
     results: List[Dict[str, str]] = []
     workers = min(max(len(model_entries), 1), 8)
@@ -136,8 +217,7 @@ def run_models_parallel(
                 entry["model"],
                 turns,
                 prompt,
-                image_bytes,
-                image_mime_type,
+                current_images,
             ): idx
             for idx, entry in enumerate(model_entries)
         }
@@ -157,8 +237,7 @@ def run_models_parallel_progress(
     model_entries: List[Dict[str, str]],
     turns: List[Dict[str, Any]],
     prompt: str,
-    image_bytes: bytes | None,
-    image_mime_type: str | None,
+    current_images: List[Dict[str, Any]],
 ):
     workers = min(max(len(model_entries), 1), 8)
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -169,8 +248,7 @@ def run_models_parallel_progress(
                 entry["model"],
                 turns,
                 prompt,
-                image_bytes,
-                image_mime_type,
+                current_images,
             ): entry["model"]
             for entry in model_entries
         }
@@ -202,8 +280,9 @@ def render_chat(turns: List[Dict[str, Any]], current_models: List[str]) -> None:
     for turn in turns:
         with st.chat_message("user"):
             st.markdown(turn["prompt"])
-            if turn.get("image_bytes") and turn.get("image_mime_type"):
-                st.image(turn["image_bytes"], caption=turn.get("image_name", "Uploaded image"))
+            turn_images = get_message_images(turn)
+            for image in turn_images:
+                st.image(image["bytes"], caption=image.get("name", "Uploaded image"))
         with st.chat_message("assistant"):
             columns = st.columns(len(current_models))
             for col, model in zip(columns, current_models):
@@ -258,6 +337,14 @@ def main() -> None:
         ]
     if "turns" not in st.session_state:
         st.session_state.turns = []
+    if "use_folder_images_next" not in st.session_state:
+        st.session_state.use_folder_images_next = False
+    if "capture_window_query" not in st.session_state:
+        st.session_state.capture_window_query = ""
+    if "capture_feedback" not in st.session_state:
+        st.session_state.capture_feedback = ""
+    if "capture_feedback_kind" not in st.session_state:
+        st.session_state.capture_feedback_kind = "info"
 
     with st.sidebar:
         st.subheader("Settings")
@@ -294,6 +381,13 @@ def main() -> None:
             st.session_state.turns = []
             st.rerun()
 
+        st.markdown("### Window Capture")
+        st.session_state.capture_window_query = st.text_input(
+            "Target window title",
+            value=st.session_state.capture_window_query,
+            help="Partial title match is supported (example: Chrome, Notepad, Visual Studio Code).",
+        )
+
     is_valid, err_msg, cleaned_entries = validate_model_entries(st.session_state.model_entries)
     if not is_valid:
         st.warning(err_msg)
@@ -304,44 +398,78 @@ def main() -> None:
     if current_models:
         render_chat(turns=st.session_state.turns, current_models=current_models)
 
+    controls_left, controls_mid, controls_right = st.columns([4, 1, 1])
+    with controls_mid:
+        if st.button("Img+", help=f"Attach all images from {DEFAULT_IMAGE_FOLDER} to next sent message."):
+            st.session_state.use_folder_images_next = True
+    with controls_right:
+        if st.button("Win+", help="Capture screenshot from target window into images folder."):
+            ok, result = capture_window_screenshot_to_folder(
+                window_title=st.session_state.capture_window_query,
+                folder=DEFAULT_IMAGE_FOLDER,
+            )
+            if ok:
+                st.session_state.capture_feedback = f"Saved screenshot: {result}"
+                st.session_state.capture_feedback_kind = "success"
+            else:
+                st.session_state.capture_feedback = result
+                st.session_state.capture_feedback_kind = "error"
+    with controls_left:
+        if st.session_state.use_folder_images_next:
+            st.caption(f"Folder images will be attached on next send: `{DEFAULT_IMAGE_FOLDER}`")
+        if st.session_state.capture_feedback:
+            if st.session_state.capture_feedback_kind == "success":
+                st.success(st.session_state.capture_feedback)
+            elif st.session_state.capture_feedback_kind == "error":
+                st.error(st.session_state.capture_feedback)
+            else:
+                st.info(st.session_state.capture_feedback)
+
     chat_input_value = st.chat_input(
         "Type your message...",
-        accept_file=True,
+        accept_file="multiple",
         file_type=["png", "jpg", "jpeg", "webp"],
     )
     if not chat_input_value:
         return
 
     prompt = ""
-    current_image_bytes = None
-    current_image_mime_type = None
-    current_image_name = None
+    current_images: List[Dict[str, Any]] = []
     if isinstance(chat_input_value, str):
         prompt = chat_input_value
     else:
         prompt = chat_input_value.text
         if chat_input_value.files:
-            first_file = chat_input_value.files[0]
-            current_image_bytes = first_file.getvalue()
-            current_image_mime_type = first_file.type
-            current_image_name = first_file.name
+            for file in chat_input_value.files:
+                if file.type:
+                    current_images.append(
+                        {"bytes": file.getvalue(), "mime_type": file.type, "name": file.name}
+                    )
+
+    if st.session_state.use_folder_images_next:
+        folder_images = load_images_from_folder(DEFAULT_IMAGE_FOLDER)
+        if folder_images:
+            current_images.extend(folder_images)
+            deleted_count = clear_images_in_folder(DEFAULT_IMAGE_FOLDER)
+            st.caption(f"Attached {len(folder_images)} folder image(s) and cleared {deleted_count} file(s).")
+            st.session_state.use_folder_images_next = False
+        else:
+            st.session_state.use_folder_images_next = False
+            st.warning(f"No supported images found in `{DEFAULT_IMAGE_FOLDER}`.")
 
     if not is_valid:
         st.error(err_msg)
         return
-    if not prompt.strip() and current_image_bytes is None:
+    if not prompt.strip() and not current_images:
         st.error("Message cannot be empty. Enter text or attach an image.")
         return
-    if not prompt.strip() and current_image_bytes is not None:
+    if not prompt.strip() and current_images:
         prompt = "Please analyze this image."
-    if current_image_bytes is not None and current_image_mime_type is None:
-        st.error("Could not determine image MIME type.")
-        return
 
     with st.chat_message("user"):
         st.markdown(prompt)
-        if current_image_bytes is not None:
-            st.image(current_image_bytes, caption=current_image_name)
+        for image in current_images:
+            st.image(image["bytes"], caption=image.get("name", "Uploaded image"))
 
     with st.chat_message("assistant"):
         response_map: Dict[str, str] = {}
@@ -358,8 +486,7 @@ def main() -> None:
                 model_entries=cleaned_entries,
                 turns=st.session_state.turns,
                 prompt=prompt,
-                image_bytes=current_image_bytes,
-                image_mime_type=current_image_mime_type,
+                current_images=current_images,
             ):
                 response_map[model] = output
                 placeholders[model].write(output)
@@ -373,9 +500,7 @@ def main() -> None:
         {
             "prompt": prompt,
             "responses": response_map,
-            "image_bytes": current_image_bytes,
-            "image_mime_type": current_image_mime_type,
-            "image_name": current_image_name,
+            "images": current_images,
         }
     )
 
