@@ -1,12 +1,42 @@
 import os
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple, Any
+import mimetypes
 
 import streamlit as st
 from google import genai
 from google.genai import types
 
 DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_IMAGE_FOLDER = Path(r"C:\Users\Pranav\Desktop\proj\github_projects\triton_practice\images")
+
+
+def get_message_images(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+    images = message.get("images")
+    if images:
+        return images
+    image_bytes = message.get("image_bytes")
+    image_mime_type = message.get("image_mime_type")
+    image_name = message.get("image_name", "Uploaded image")
+    if image_bytes and image_mime_type:
+        return [{"bytes": image_bytes, "mime_type": image_mime_type, "name": image_name}]
+    return []
+
+
+def load_images_from_folder(folder: Path) -> List[Dict[str, Any]]:
+    if not folder.exists() or not folder.is_dir():
+        return []
+    supported_suffixes = {".png", ".jpg", ".jpeg", ".webp"}
+    images: List[Dict[str, Any]] = []
+    for path in sorted(folder.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in supported_suffixes:
+            continue
+        mime_type = mimetypes.guess_type(path.name)[0]
+        if not mime_type:
+            continue
+        images.append({"bytes": path.read_bytes(), "mime_type": mime_type, "name": path.name})
+    return images
 
 
 def message_to_parts(message: Dict[str, Any]) -> List[types.Part]:
