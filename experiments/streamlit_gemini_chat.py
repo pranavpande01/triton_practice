@@ -192,7 +192,10 @@ def main() -> None:
     st.markdown(
         """
         <style>
-        [data-testid="column"] { min-width: 0; }
+        [data-testid="column"] {
+          min-width: 0;
+          overflow: hidden;
+        }
         [data-testid="column"] .stMarkdown,
         [data-testid="column"] .stCodeBlock,
         [data-testid="column"] pre,
@@ -200,6 +203,19 @@ def main() -> None:
           white-space: pre-wrap !important;
           overflow-wrap: anywhere !important;
           word-break: break-word !important;
+        }
+        [data-testid="column"] .stMarkdown table {
+          display: block !important;
+          max-width: 100% !important;
+          overflow-x: auto !important;
+          white-space: nowrap !important;
+          border-collapse: collapse;
+        }
+        [data-testid="column"] .stMarkdown thead,
+        [data-testid="column"] .stMarkdown tbody,
+        [data-testid="column"] .stMarkdown tr {
+          display: table;
+          width: max-content;
         }
         </style>
         """,
